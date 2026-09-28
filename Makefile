@@ -13,7 +13,7 @@ SHIM := elan-led-shim.so
 all: $(SHIM)
 
 $(SHIM): src/elan-led-shim.c
-	$(CC) $(CFLAGS) -fPIC -shared $(USB_CFLAGS) -o $@ $< -ldl $(USB_LIBS)
+	$(CC) $(CFLAGS) -pthread -fPIC -shared $(USB_CFLAGS) -o $@ $< -ldl -pthread $(USB_LIBS)
 
 install: $(SHIM)
 	install -D -m 0755 $(SHIM) $(DESTDIR)$(LIBDIR)/$(SHIM)
