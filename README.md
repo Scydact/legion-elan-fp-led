@@ -1,5 +1,7 @@
 # legion-elan-fp-led
 
+![Power button ring: white normally (left), green while waiting for a finger (right)](docs/power-button-led.jpg)
+
 Make the power-button LED on Lenovo Legion laptops flash green while the
 fingerprint reader is waiting for a finger, the same way it does under
 Windows Hello.
@@ -45,8 +47,20 @@ LED behaviour confirmed with both the white (balanced) and red (performance)
 power-profile colours: green while waiting for a finger, then back to the
 profile colour.
 
-If it works (or doesn't) on another model, please open an issue with your
-model, BIOS and distro.
+### Other models
+
+Only the machine above has been tested. Other Legion or Lenovo laptops with an
+ELAN `04f3:0c4b` in the power button are untested but may well work. To check
+yours:
+
+1. `lsusb | grep 04f3:0c4b` must list the sensor.
+2. With fprintd stopped, run `sudo python3 tools/led-test.py` (see
+   [Trying it without installing](#trying-it-without-installing)) and watch
+   whether the ring goes green and back.
+
+Reports are very welcome, whether it works or not: please open an issue with
+your model and machine type, BIOS version, distro, the versions of fprintd,
+libfprint-tod and the 0c4b TOD driver package, and whether the LED went green.
 
 ## Install
 
@@ -214,3 +228,7 @@ found; see [docs/protocol.md](docs/protocol.md).
 This is not affiliated with or endorsed by Lenovo or ELAN. It sends
 vendor-specific commands to your fingerprint sensor that were observed from
 the Windows driver; use at your own risk.
+
+## License
+
+[MIT](LICENSE).

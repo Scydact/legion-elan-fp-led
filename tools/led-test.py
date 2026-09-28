@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Manually switch the power-button LED through the ELAN 04f3:0c4b sensor.
 
 Use this to check that your machine reacts to the LED commands before

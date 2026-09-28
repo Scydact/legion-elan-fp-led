@@ -17,6 +17,8 @@
  *   ELAN_LED_MODE=inject  send the LED commands (default)
  *   ELAN_LED_MODE=log     log every command to stderr, send nothing
  *   ELAN_LED_MODE=off     do nothing
+ *
+ * SPDX-License-Identifier: MIT
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
