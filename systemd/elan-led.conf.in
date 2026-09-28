@@ -1,0 +1,5 @@
+# Installed by legion-elan-fp-led. Remove this file (and run
+# `systemctl daemon-reload && systemctl restart fprintd`) to disable.
+[Service]
+Environment=LD_PRELOAD=@LIBDIR@/elan-led-shim.so
+Environment=ELAN_LED_MODE=@MODE@
