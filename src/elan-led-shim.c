@@ -85,6 +85,13 @@ static int led_is_green;
 static int fail_pending;                  /* no match reported, not yet retried or restored */
 static unsigned long timer_gen;           /* bumped to cancel a pending restore timer */
 
+/*
+ * Set while the shim itself sends a command. libusb's own sync transfers call
+ * libusb_submit_transfer(), which resolves to our wrapper; without this guard
+ * that re-enters on_command() while lock is held and deadlocks.
+ */
+static __thread int in_shim;
+
 static void do_init(void)
 {
     real_submit  = dlsym(RTLD_NEXT, "libusb_submit_transfer");
@@ -166,10 +173,12 @@ static void send(libusb_device_handle *h, const unsigned char *cmd, int async)
 {
     if (mode != MODE_INJECT)
         return;
+    in_shim++;
     if (async)
         send_async(h, cmd);
     else
         send_sync(h, cmd);
+    in_shim--;
 }
 
 static void decision(const char *what)
@@ -293,7 +302,8 @@ static void on_match_result(int matched)
 int libusb_submit_transfer(struct libusb_transfer *t)
 {
     init();
-    if (t->type != LIBUSB_TRANSFER_TYPE_BULK || t->endpoint != EP_CMD || !is_elan(t->dev_handle))
+    if (in_shim || t->type != LIBUSB_TRANSFER_TYPE_BULK || t->endpoint != EP_CMD ||
+        !is_elan(t->dev_handle))
         return real_submit(t);
     log_cmd("async", t->buffer, t->length);
     on_command(t->dev_handle, t->buffer, t->length, 1, 1);
@@ -306,7 +316,7 @@ int libusb_bulk_transfer(libusb_device_handle *h, unsigned char ep, unsigned cha
                          int len, int *transferred, unsigned int timeout)
 {
     init();
-    if (ep != EP_CMD || !is_elan(h))
+    if (in_shim || ep != EP_CMD || !is_elan(h))
         return real_bulk(h, ep, data, len, transferred, timeout);
     log_cmd("sync", data, len);
     on_command(h, data, len, 1, 0);
@@ -318,7 +328,7 @@ int libusb_bulk_transfer(libusb_device_handle *h, unsigned char ep, unsigned cha
 int libusb_release_interface(libusb_device_handle *h, int iface)
 {
     init();
-    if (is_elan(h))
+    if (!in_shim && is_elan(h))
         on_handle_gone(h, "release_interface");
     return real_release(h, iface);
 }
@@ -326,7 +336,7 @@ int libusb_release_interface(libusb_device_handle *h, int iface)
 void libusb_close(libusb_device_handle *h)
 {
     init();
-    if (is_elan(h))
+    if (!in_shim && is_elan(h))
         on_handle_gone(h, "close");
     real_close(h);
 }
