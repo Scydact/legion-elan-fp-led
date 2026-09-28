@@ -22,7 +22,9 @@ You need **all** of these:
   (it shows as `Elan Microelectronics Corp. ELAN:Fingerprint`).
 - The proprietary **libfprint TOD driver for 0c4b** (`libfprint-2-tod1-elan-0c4b`,
   file `libfprint-2-tod1-elan-0c4b.so`) with **libfprint-tod**, i.e. fingerprint
-  login already works for you through `fprintd`.
+  login already works for you through `fprintd`. See
+  [Installing the fingerprint driver](#installing-the-fingerprint-driver-fedora)
+  for how it was set up on the tested machine.
 - A power button with a built-in LED that goes green in Windows Hello.
 - systemd running `fprintd.service`.
 
@@ -63,6 +65,49 @@ yours:
 Reports are very welcome, whether it works or not: please open an issue with
 your model and machine type, BIOS version, distro, the versions of fprintd,
 libfprint-tod and the 0c4b TOD driver package, and whether the LED went green.
+
+## Installing the fingerprint driver (Fedora)
+
+This project only adds the LED; the sensor itself needs Lenovo's proprietary
+ELAN 0c4b driver for libfprint's TOD ("Touch OEM Drivers") variant. On the
+tested machine it comes from the Copr repository
+[`quantt/libfprint-tod`](https://copr.fedorainfracloud.org/coprs/quantt/libfprint-tod/),
+which packages `libfprint-tod` and the driver blob published by Lenovo's
+[libfprint-tod1 Launchpad group](https://launchpad.net/~libfprint-tod1-group).
+The shim was developed and tested against exactly these packages.
+
+```bash
+# 1. Enable the Copr repository
+sudo dnf copr enable quantt/libfprint-tod
+
+# 2. Replace Fedora's libfprint with the TOD-capable build
+sudo dnf swap libfprint libfprint-tod
+
+# 3. Install the ELAN 04f3:0c4b driver
+sudo dnf install libfprint-2-tod1-elan-0c4b
+
+# 4. Fingerprint login (fprintd and fprintd-pam come from Fedora's repos)
+sudo dnf install fprintd fprintd-pam
+sudo authselect enable-feature with-fingerprint
+
+# 5. Enroll a finger (or use System Settings > Users in KDE)
+fprintd-enroll
+```
+
+The driver installs `/usr/lib64/libfprint-2/tod-1/libfprint-2-tod1-elan-0c4b.so`
+and a udev rule, `/usr/lib/udev/rules.d/60-libfprint-2-tod1-elan-0c4b.rules`.
+`fprintd-list $USER` should then list your fingers, and `fprintd-verify` should
+accept one.
+
+Notes:
+
+- Both `libfprint-tod` and the driver are updated from the Copr, not from
+  Fedora. After a Fedora release upgrade, check that `libfprint-tod` is still
+  installed (`rpm -q libfprint-tod`); if the upgrade put the stock `libfprint`
+  back, repeat step 2 once the Copr has builds for the new release.
+- On other distributions, install `libfprint-tod` and the
+  `libfprint-2-tod1-elan-0c4b` driver from your distribution or from Lenovo's
+  Launchpad group. Only the Fedora Copr packages have been tested.
 
 ## Install
 
