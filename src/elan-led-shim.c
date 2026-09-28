@@ -12,6 +12,9 @@
  *   40 3f  (wait for finger)  -> send "LED green" just before it
  *   00 0b  (stop)             -> send "LED restore" just after it
  *   release / close           -> send "LED restore" if still green
+ *   transfer cancelled        -> send "LED restore" if still green (the
+ *                                prompt was abandoned, e.g. the lock screen
+ *                                was unlocked with the password)
  *
  * Matching happens on the host, so a failed match looks the same as a good
  * one on USB. The library also wraps libfprint's fpi_device_verify_report()
@@ -72,6 +75,7 @@ static int (*real_submit)(struct libusb_transfer *);
 static int (*real_bulk)(libusb_device_handle *, unsigned char, unsigned char *, int, int *, unsigned int);
 static int (*real_release)(libusb_device_handle *, int);
 static void (*real_close)(libusb_device_handle *);
+static int (*real_cancel)(struct libusb_transfer *);
 static void (*real_verify_report)(void *, int, void *, void *);
 static void (*real_identify_report)(void *, void *, void *, void *);
 
@@ -98,6 +102,7 @@ static void do_init(void)
     real_bulk    = dlsym(RTLD_NEXT, "libusb_bulk_transfer");
     real_release = dlsym(RTLD_NEXT, "libusb_release_interface");
     real_close   = dlsym(RTLD_NEXT, "libusb_close");
+    real_cancel  = dlsym(RTLD_NEXT, "libusb_cancel_transfer");
     real_verify_report   = dlvsym(RTLD_NEXT, "fpi_device_verify_report", FPRINT_TOD_VERSION);
     real_identify_report = dlvsym(RTLD_NEXT, "fpi_device_identify_report", FPRINT_TOD_VERSION);
     if (!real_verify_report)
@@ -283,6 +288,25 @@ static void on_handle_gone(libusb_device_handle *h, const char *what)
     pthread_mutex_unlock(&lock);
 }
 
+/*
+ * The driver cancels its pending transfer when the client stops the scan
+ * without a result (VerifyStop, e.g. the lock screen unlocked by password).
+ * No 00 0b follows, and fprintd may keep the device open, so restore here.
+ */
+static void on_cancel(struct libusb_transfer *t)
+{
+    if (mode == MODE_LOG)
+        fprintf(stderr, "elan-led-shim: cancel ep%02x\n", t->endpoint);
+    pthread_mutex_lock(&lock);
+    if (led_is_green) {
+        decision("restore on cancel");
+        fail_pending = 0;
+        timer_gen++;
+        set_led_locked(t->dev_handle, 0, 1);
+    }
+    pthread_mutex_unlock(&lock);
+}
+
 static void on_match_result(int matched)
 {
     pthread_mutex_lock(&lock);
@@ -339,6 +363,15 @@ void libusb_close(libusb_device_handle *h)
     if (!in_shim && is_elan(h))
         on_handle_gone(h, "close");
     real_close(h);
+}
+
+int libusb_cancel_transfer(struct libusb_transfer *t)
+{
+    init();
+    int r = real_cancel(t);
+    if (!in_shim && t && is_elan(t->dev_handle))
+        on_cancel(t);
+    return r;
 }
 
 void fpi_device_verify_report(void *device, int result, void *print, void *error)
