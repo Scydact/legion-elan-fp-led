@@ -3,13 +3,14 @@
 ![Power button ring: white normally (left), green while waiting for a finger (right)](docs/power-button-led.jpg)
 
 Make the power-button LED on Lenovo Legion laptops flash green while the
-fingerprint reader is waiting for a finger, the same way it does under
-Windows Hello.
+fingerprint reader is waiting for a finger, and flash white when the finger
+doesn't match, the same way it does under Windows Hello.
 
 On these laptops the fingerprint reader sits in the power button. On Windows
 the button's LED flashes green and stays green during a fingerprint prompt,
-then returns to the power-profile colour. On Linux the Lenovo/ELAN libfprint
-driver never sends that command, so the LED never changes. This project adds
+flashes white after a failed match, then returns to the power-profile colour.
+On Linux the Lenovo/ELAN libfprint driver never sends those commands, so the
+LED never changes. This project adds
 it back with a tiny `LD_PRELOAD` library for `fprintd`; nothing in fprintd,
 libfprint or the kernel is modified.
 
@@ -43,9 +44,10 @@ Other ELAN sensors or drivers may use different commands; see
 | TOD driver | `libfprint-2-tod1-elan-0c4b` 0.1.0-4.fc44 (same Copr) |
 | libusb / libgusb | 1.0.30 / 0.4.9 |
 
-LED behaviour confirmed with both the white (balanced) and red (performance)
-power-profile colours: green while waiting for a finger, then back to the
-profile colour.
+LED behaviour confirmed with the white (balanced), red (performance) and blue
+(quiet) power-profile colours: green while waiting for a finger, a white flash
+on a wrong finger, then back to the profile colour. Tested with
+`fprintd-verify`, `sudo` and the KDE lock screen.
 
 ### Other models
 
@@ -109,7 +111,8 @@ journalctl -u fprintd -b | grep elan-led-shim
 ```
 
 You should see `elan-led-shim: loaded, mode=inject` each time fprintd starts,
-and the LED should go green while it waits for your finger. In `inject` mode
+and the LED should go green while it waits for your finger and flash white if
+you use a finger that isn't enrolled. In `inject` mode
 that one line is all the shim logs, so the journal stays quiet in normal use;
 to see every command, reinstall with `MODE=log` (see [Modes](#modes)).
 
@@ -143,11 +146,22 @@ Set by `ELAN_LED_MODE` in the drop-in (`sudo make install MODE=...`):
 | Mode | Effect |
 |---|---|
 | `inject` | Sends the LED commands. Logs only one `loaded` line. Default, also when the variable is unset. |
-| `log` | Logs every command fprintd sends to the sensor. Sends nothing. Useful to check a new sensor or driver version. |
+| `log` | Logs every command fprintd sends to the sensor, every match result and what the shim would do. Sends nothing. Useful to check a new sensor or driver version. |
 | `off` | Does nothing, as if the shim were not loaded. |
 
 The shim prints to stderr, which systemd sends to the journal
-(`journalctl -u fprintd`).
+(`journalctl -u fprintd`). In `log` mode the lines look like:
+
+```
+elan-led-shim: async OUT 403f          command sent to the sensor
+elan-led-shim: identify match=no       match result from the driver
+elan-led-shim: verify result=1         (-1 error, 0 no match, 1 match)
+elan-led-shim: fail flash              what inject mode would do:
+elan-led-shim: hold at 000b              fail flash / hold at 000b /
+elan-led-shim: re-arm white              re-arm white / delayed restore
+elan-led-shim: release_interface       fprintd let go of the sensor
+elan-led-shim: close
+```
 
 ## Trying it without installing
 
@@ -196,6 +210,27 @@ Everything else passes through untouched. The TOD blob only uses async
 transfers, so the injected commands are queued with `libusb_submit_transfer`
 on the same endpoint, in order, just before the driver's own command.
 
+### Failed matches
+
+Matching happens on the host, inside the TOD blob, after the image is read, so
+a wrong finger and a right finger produce exactly the same USB traffic. To see
+the result, the shim also wraps the two libfprint functions the blob reports
+it with, `fpi_device_verify_report` and `fpi_device_identify_report`
+(exported by `libfprint-2-tod.so.1`, symbol version `LIBFPRINT_TOD_1.0.0`),
+and forwards them to the real ones. The result arrives just before the
+driver's `00 0b`. On a no-match it copies the Windows behaviour:
+
+| Event | LED action |
+|---|---|
+| no match (`verify result=0`, `identify match=no`) | send the fail command: white flash, then green |
+| `00 0b` right after it | keep the LED; restore it 1.5 s later unless the scan is retried |
+| next `40 3f` (lock screen / PAM retry on the same open device) | send the re-arm command: white flash, then green; cancel the timer |
+| release / close with a failure pending (`fprintd-verify` closes at once) | wait 1 s so the flash is visible, then restore |
+| match | clear the pending failure; restore at `00 0b` as usual |
+
+Retry errors (finger too short, remove and retry...) don't trigger the fail
+flash.
+
 The byte-level details, the Windows capture and the Linux command sequence are
 in [docs/protocol.md](docs/protocol.md).
 
@@ -218,8 +253,12 @@ found; see [docs/protocol.md](docs/protocol.md).
 - If fprintd crashes while the LED is green, it stays green until the next
   fingerprint prompt ends, you run `tools/led-test.py restore`, or you reboot.
 - The injected transfers are fire-and-forget; a failure is not reported.
-- Only the flashing-then-green mode seen in Windows is used. Other values of the
-  LED registers are untested.
+- The sensor only seems to offer green and white; no value tried gave any
+  other colour (see [docs/protocol.md](docs/protocol.md)). The amber some
+  other laptops show on a failed match is not available on this one.
+- After a failed match with `fprintd-verify` (which closes the device at
+  once), fprintd pauses about 1 s before releasing the sensor so the white
+  flash is visible.
 - The drop-in replaces nothing in the stock `fprintd.service`, but if your
   distro already sets `LD_PRELOAD` for fprintd, the two will conflict.
 
