@@ -15,9 +15,12 @@
  *
  * Matching happens on the host, so a failed match looks the same as a good
  * one on USB. The library also wraps libfprint's fpi_device_verify_report()
- * and fpi_device_identify_report(); on "no match" it sends the Windows fail
- * flash (white flash, then green) and restores the LED 1.5 s later unless a
- * new scan has started.
+ * and fpi_device_identify_report(). On "no match" it copies what Windows does:
+ *
+ *   no match          -> send the fail flash (white flash, then green)
+ *   00 0b after it    -> keep the LED, restore 1.5 s later unless retried
+ *   40 3f (retry)     -> send the re-arm (white flash, then green)
+ *   release / close   -> wait ~1 s so the flash is visible, then restore
  *
  * Environment:
  *   ELAN_LED_MODE=inject  send the LED commands (default)
@@ -43,6 +46,7 @@
 
 #define FPRINT_TOD_VERSION "LIBFPRINT_TOD_1.0.0"
 #define FAIL_RESTORE_DELAY_NS 1500000000L
+#define FAIL_CLOSE_DELAY_NS   1000000000L
 
 /* FpiMatchResult from libfprint's fpi-device.h */
 enum { FPI_MATCH_ERROR = -1, FPI_MATCH_FAIL = 0, FPI_MATCH_SUCCESS = 1 };
@@ -59,6 +63,10 @@ static const unsigned char LED_RESTORE[2][CMD_LEN] = {
 };
 static const unsigned char LED_FAIL[CMD_LEN] =
     {0x46, 0x07, 0x90, 0x01, 0x04, 0x20, 0xc0, 0x30, 0x00};
+static const unsigned char LED_REARM[2][CMD_LEN] = {
+    {0x46, 0x07, 0x90, 0x01, 0x04, 0x40, 0x00, 0x00, 0x00},
+    {0x46, 0x07, 0x80, 0x01, 0x04, 0x40, 0x00, 0x00, 0x00},
+};
 
 static int (*real_submit)(struct libusb_transfer *);
 static int (*real_bulk)(libusb_device_handle *, unsigned char, unsigned char *, int, int *, unsigned int);
@@ -74,7 +82,8 @@ static pthread_once_t init_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static libusb_device_handle *elan_handle; /* last open ELAN handle, NULL once closed */
 static int led_is_green;
-static unsigned long scan_seq;            /* bumped on every 40 3f */
+static int fail_pending;                  /* no match reported, not yet retried or restored */
+static unsigned long timer_gen;           /* bumped to cancel a pending restore timer */
 
 static void do_init(void)
 {
@@ -153,19 +162,65 @@ static void send_sync(libusb_device_handle *h, const unsigned char *cmd)
     real_bulk(h, EP_CMD, (unsigned char *)cmd, CMD_LEN, &done, 1000);
 }
 
+static void send(libusb_device_handle *h, const unsigned char *cmd, int async)
+{
+    if (mode != MODE_INJECT)
+        return;
+    if (async)
+        send_async(h, cmd);
+    else
+        send_sync(h, cmd);
+}
+
+static void decision(const char *what)
+{
+    if (mode == MODE_LOG)
+        fprintf(stderr, "elan-led-shim: %s\n", what);
+}
+
+static void sleep_ns(long ns)
+{
+    struct timespec ts = { ns / 1000000000L, ns % 1000000000L };
+    nanosleep(&ts, NULL);
+}
+
 /* Caller holds lock. */
 static void set_led_locked(libusb_device_handle *h, int green, int async)
 {
-    if (mode != MODE_INJECT || green == led_is_green)
+    if (green == led_is_green)
         return;
     const unsigned char (*seq)[CMD_LEN] = green ? LED_GREEN : LED_RESTORE;
-    for (int i = 0; i < 2; i++) {
-        if (async)
-            send_async(h, seq[i]);
-        else
-            send_sync(h, seq[i]);
-    }
+    send(h, seq[0], async);
+    send(h, seq[1], async);
     led_is_green = green;
+}
+
+static void *fail_restore_thread(void *arg)
+{
+    unsigned long gen = (unsigned long)arg;
+    sleep_ns(FAIL_RESTORE_DELAY_NS);
+
+    pthread_mutex_lock(&lock);
+    /* Skip if the device was closed, the scan was retried or a match came in. */
+    if (elan_handle && fail_pending && timer_gen == gen) {
+        decision("delayed restore");
+        fail_pending = 0;
+        set_led_locked(elan_handle, 0, 1);
+    }
+    pthread_mutex_unlock(&lock);
+    return NULL;
+}
+
+/* Caller holds lock. */
+static void start_restore_timer_locked(void)
+{
+    pthread_t thread;
+    pthread_attr_t attr;
+
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&thread, &attr, fail_restore_thread, (void *)++timer_gen);
+    pthread_attr_destroy(&attr);
 }
 
 /* Called before and after each ELAN command; before == 1 before submitting it. */
@@ -174,18 +229,44 @@ static void on_command(libusb_device_handle *h, const unsigned char *b, int len,
     pthread_mutex_lock(&lock);
     elan_handle = h;
     if (before && is_cmd(b, len, 0x40, 0x3f)) {
-        scan_seq++;
-        set_led_locked(h, 1, async);
+        if (fail_pending) {
+            decision("re-arm white");
+            fail_pending = 0;
+            timer_gen++;
+            send(h, LED_REARM[0], async);
+            send(h, LED_REARM[1], async);
+            led_is_green = 1;
+        } else {
+            set_led_locked(h, 1, async);
+        }
     } else if (!before && is_cmd(b, len, 0x00, 0x0b)) {
-        set_led_locked(h, 0, async);
+        if (fail_pending) {
+            decision("hold at 000b");
+            start_restore_timer_locked();
+        } else {
+            set_led_locked(h, 0, async);
+        }
     }
     pthread_mutex_unlock(&lock);
 }
 
 static void on_handle_gone(libusb_device_handle *h, const char *what)
 {
-    if (mode == MODE_LOG)
-        fprintf(stderr, "elan-led-shim: %s\n", what);
+    int pending;
+
+    decision(what);
+    pthread_mutex_lock(&lock);
+    pending = fail_pending && led_is_green;
+    fail_pending = 0;
+    timer_gen++;
+    pthread_mutex_unlock(&lock);
+
+    /* Let the fail flash play before handing the LED back (fprintd-verify closes right away). */
+    if (pending) {
+        decision("delayed restore");
+        sleep_ns(FAIL_CLOSE_DELAY_NS);
+    }
+
     pthread_mutex_lock(&lock);
     set_led_locked(h, 0, 0);
     if (elan_handle == h)
@@ -193,42 +274,20 @@ static void on_handle_gone(libusb_device_handle *h, const char *what)
     pthread_mutex_unlock(&lock);
 }
 
-static void *fail_restore_thread(void *arg)
+static void on_match_result(int matched)
 {
-    unsigned long seq = (unsigned long)arg;
-    struct timespec ts = { FAIL_RESTORE_DELAY_NS / 1000000000L, FAIL_RESTORE_DELAY_NS % 1000000000L };
-    nanosleep(&ts, NULL);
-
     pthread_mutex_lock(&lock);
-    /* Skip if the device was closed or a new scan started meanwhile. */
-    if (elan_handle && scan_seq == seq)
-        set_led_locked(elan_handle, 0, 1);
-    pthread_mutex_unlock(&lock);
-    return NULL;
-}
-
-static void on_no_match(void)
-{
-    pthread_t thread;
-    pthread_attr_t attr;
-    unsigned long seq;
-
-    if (mode != MODE_INJECT)
-        return;
-    pthread_mutex_lock(&lock);
-    if (!elan_handle) {
-        pthread_mutex_unlock(&lock);
-        return;
+    if (matched) {
+        fail_pending = 0;
+        timer_gen++;
+    } else if (elan_handle) {
+        decision("fail flash");
+        send(elan_handle, LED_FAIL, 1);
+        led_is_green = 1;       /* the fail flash ends in solid green */
+        fail_pending = 1;
+        timer_gen++;
     }
-    send_async(elan_handle, LED_FAIL);
-    led_is_green = 1;       /* the fail flash ends in solid green */
-    seq = scan_seq;
     pthread_mutex_unlock(&lock);
-
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_create(&thread, &attr, fail_restore_thread, (void *)seq);
-    pthread_attr_destroy(&attr);
 }
 
 int libusb_submit_transfer(struct libusb_transfer *t)
@@ -275,11 +334,10 @@ void libusb_close(libusb_device_handle *h)
 void fpi_device_verify_report(void *device, int result, void *print, void *error)
 {
     init();
-    if (mode == MODE_LOG) {
+    if (mode == MODE_LOG)
         fprintf(stderr, "elan-led-shim: verify result=%d%s\n", result, error ? " (with error)" : "");
-    }
-    if (mode != MODE_OFF && result == FPI_MATCH_FAIL && !error)
-        on_no_match();
+    if (mode != MODE_OFF && !error && result != FPI_MATCH_ERROR)
+        on_match_result(result == FPI_MATCH_SUCCESS);
     if (real_verify_report)
         real_verify_report(device, result, print, error);
 }
@@ -287,12 +345,11 @@ void fpi_device_verify_report(void *device, int result, void *print, void *error
 void fpi_device_identify_report(void *device, void *match, void *print, void *error)
 {
     init();
-    if (mode == MODE_LOG) {
+    if (mode == MODE_LOG)
         fprintf(stderr, "elan-led-shim: identify match=%s%s\n", match ? "yes" : "no",
                 error ? " (with error)" : "");
-    }
-    if (mode != MODE_OFF && !match && !error)
-        on_no_match();
+    if (mode != MODE_OFF && !error)
+        on_match_result(match != NULL);
     if (real_identify_report)
         real_identify_report(device, match, print, error);
 }
