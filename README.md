@@ -73,8 +73,11 @@ This installs:
 - `/etc/systemd/system/fprintd.service.d/elan-led.conf`, which sets
   `LD_PRELOAD` and `ELAN_LED_MODE=inject` for fprintd
 
-and restarts fprintd if it is running. On distros without `lib64` (Debian,
-Ubuntu, Arch) use `sudo make install LIBDIR=/usr/local/lib`.
+and restarts fprintd if it is running.
+
+**Debian, Ubuntu, Arch:** these have no `/usr/local/lib64`; install with
+`sudo make install LIBDIR=/usr/local/lib` (and uninstall with the same
+`LIBDIR=`).
 
 The library must live in a system directory: `fprintd.service` runs with
 `ProtectHome=true`, and on SELinux systems a file in your home directory is
@@ -91,9 +94,25 @@ sudo -k; sudo true          # authenticate with your finger
 journalctl -u fprintd -b | grep elan-led-shim
 ```
 
-You should see `loaded, mode=inject`, then `LED green` and `LED restore`. If
-the shim never shows up, look for an SELinux denial:
+You should see `elan-led-shim: loaded, mode=inject` each time fprintd starts,
+and the LED should go green while it waits for your finger. In `inject` mode
+that one line is all the shim logs, so the journal stays quiet in normal use;
+to see every command, reinstall with `MODE=log` (see [Modes](#modes)).
+
+If the `loaded` line never shows up, look for an SELinux denial:
 `sudo ausearch -m avc -ts recent`.
+
+### If the LED ever stays green
+
+This can happen if fprintd crashes mid-scan. Restore it by hand:
+
+```bash
+sudo systemctl stop fprintd
+sudo python3 tools/led-test.py restore
+sudo systemctl start fprintd
+```
+
+(needs pyusb, see [Trying it without installing](#trying-it-without-installing)).
 
 ## Uninstall
 
@@ -105,14 +124,16 @@ sudo make uninstall
 
 ## Modes
 
-Set by `ELAN_LED_MODE` in the drop-in:
+Set by `ELAN_LED_MODE` in the drop-in (`sudo make install MODE=...`):
 
 | Mode | Effect |
 |---|---|
-| `log` | Only logs every command sent to the sensor. Sends nothing. |
-| `inject` | Logs and sends the LED commands. (`make install` default) |
+| `inject` | Sends the LED commands. Logs only one `loaded` line. Default, also when the variable is unset. |
+| `log` | Logs every command fprintd sends to the sensor. Sends nothing. Useful to check a new sensor or driver version. |
+| `off` | Does nothing, as if the shim were not loaded. |
 
-`sudo make install MODE=log` installs in log-only mode.
+The shim prints to stderr, which systemd sends to the journal
+(`journalctl -u fprintd`).
 
 ## Trying it without installing
 
@@ -121,7 +142,7 @@ Stop fprintd and run it by hand with the library preloaded:
 ```bash
 make
 sudo systemctl stop fprintd
-sudo env LD_PRELOAD=$PWD/elan-led-shim.so ELAN_LED_MODE=inject \
+sudo env LD_PRELOAD=$PWD/elan-led-shim.so ELAN_LED_MODE=log \
     /usr/libexec/fprintd -t 2>&1 | grep elan-led-shim
 # in another terminal: fprintd-verify
 sudo systemctl start fprintd
@@ -130,15 +151,21 @@ sudo systemctl start fprintd
 (`/usr/libexec/fprintd` is the Fedora path; on other distros use the
 `ExecStart=` from `systemctl cat fprintd`.)
 
-To test just the LED, without fprintd, there is a Python script that replays
-the raw commands step by step:
+`ELAN_LED_MODE=log` prints every command; switch to `inject` to see the LED
+change (it then prints only the `loaded` line).
+
+To test just the LED, without fprintd, `tools/led-test.py` sends the "green"
+commands, waits for Enter, then sends "restore":
 
 ```bash
-sudo dnf install python3-pyusb      # or: sudo apt install python3-usb
+sudo dnf install python3-pyusb   # Debian/Ubuntu: python3-usb, Arch: python-pyusb
 sudo systemctl stop fprintd
-sudo python3 tools/led-test.py
+sudo python3 tools/led-test.py            # green, then restore
+sudo python3 tools/led-test.py restore    # only restore
 sudo systemctl start fprintd
 ```
+
+If it says it cannot claim the sensor, fprintd is still running.
 
 ## How it works
 
@@ -175,7 +202,7 @@ found; see [docs/protocol.md](docs/protocol.md).
 ## Limitations
 
 - If fprintd crashes while the LED is green, it stays green until the next
-  fingerprint prompt ends or you reboot.
+  fingerprint prompt ends, you run `tools/led-test.py restore`, or you reboot.
 - The injected transfers are fire-and-forget; a failure is not reported.
 - Only the flashing-then-green mode seen in Windows is used. Other values of the
   LED registers are untested.

@@ -1,59 +1,57 @@
 #!/usr/bin/env python3
-"""Replay the ELAN 04f3:0c4b LED commands seen in a Windows Hello USB capture.
+"""Manually switch the power-button LED through the ELAN 04f3:0c4b sensor.
 
-Run as root with fprintd stopped:
+Use this to check that your machine reacts to the LED commands before
+installing the shim. fprintd must not hold the sensor while it runs:
+
   sudo systemctl stop fprintd
-  sudo python3 led-test.py
+  sudo python3 tools/led-test.py            # interactive: green, then restore
+  sudo python3 tools/led-test.py restore    # only restore the LED
   sudo systemctl start fprintd
 
-Only sends the exact bytes the Windows driver sent. Each step waits for Enter
-so you can watch the power button LED.
+Requires pyusb (Fedora: python3-pyusb, Debian/Ubuntu: python3-usb,
+Arch: python-pyusb). Sends only the bytes the Windows driver sends.
 """
-import sys, time
-import usb.core, usb.util
+import sys
+import usb.core
+import usb.util
 
 VID, PID = 0x04F3, 0x0C4B
-EP_OUT, EP_RESP = 0x01, 0x83
+EP_OUT = 0x01
 
-dev = usb.core.find(idVendor=VID, idProduct=PID)
-if dev is None:
-    sys.exit("ELAN 04f3:0c4b not found")
-if dev.is_kernel_driver_active(0):
-    sys.exit("interface 0 is held by a kernel driver, aborting")
-usb.util.claim_interface(dev, 0)
+GREEN = ["460790010400000000", "460780010440000000"]
+RESTORE = ["460780010440000000", "460790010410000000"]
 
-def send(hexstr, read=0):
-    dev.write(EP_OUT, bytes.fromhex(hexstr), timeout=1000)
-    out = ""
-    if read:
-        try:
-            out = bytes(dev.read(EP_RESP, read, timeout=1000)).hex()
-        except usb.core.USBTimeoutError:
-            out = "(no reply)"
-    print(f"  > {hexstr}  {out}")
 
-def step(title):
-    input(f"\n{title}\nPress Enter to send...")
+def send(dev, cmds):
+    for c in cmds:
+        dev.write(EP_OUT, bytes.fromhex(c), timeout=1000)
+        print(f"  > {c}")
 
-try:
-    step("Step 1: status query + 40 31 (Windows sends this first)")
-    send("9a10", read=4)
-    send("4031")
-    send("9a10", read=4)
-    input("Did the LED change? Note it, then press Enter.")
 
-    step("Step 2: 46 07 90 ... 00 and 46 07 80 ... 40 (sent right before waiting for a finger)")
-    send("460790010400000000")
-    send("460780010440000000")
-    input("Did the LED start flashing green? Note it, then press Enter.")
+def main():
+    dev = usb.core.find(idVendor=VID, idProduct=PID)
+    if dev is None:
+        sys.exit("ELAN 04f3:0c4b not found (check lsusb)")
+    try:
+        usb.util.claim_interface(dev, 0)
+    except usb.core.USBError as e:
+        sys.exit(f"cannot claim the sensor ({e}). Is fprintd still running? "
+                 "Run: sudo systemctl stop fprintd")
+    try:
+        if len(sys.argv) > 1 and sys.argv[1] == "restore":
+            send(dev, RESTORE)
+            return
+        input("Press Enter to turn the LED green...")
+        send(dev, GREEN)
+        input("The LED should flash and then stay green. Press Enter to restore...")
+        send(dev, RESTORE)
+        print("The LED should be back to its normal colour.")
+    finally:
+        usb.util.release_interface(dev, 0)
+        usb.util.dispose_resources(dev)
+        print("Now run: sudo systemctl start fprintd")
 
-    step("Step 3: restore sequence Windows sent after the scan")
-    send("460780010440000000")
-    send("9a10", read=4)
-    send("000b")
-    send("460790010410000000")
-    input("Is the LED back to normal? Press Enter to finish.")
-finally:
-    usb.util.release_interface(dev, 0)
-    usb.util.dispose_resources(dev)
-    print("\nDone. Now run: sudo systemctl start fprintd")
+
+if __name__ == "__main__":
+    main()
