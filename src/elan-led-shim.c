@@ -90,6 +90,17 @@ static int fail_pending;                  /* no match reported, not yet retried 
 static unsigned long timer_gen;           /* bumped to cancel a pending restore timer */
 
 /*
+ * Touched by on_cancel() without lock (atomics only). libusb calls
+ * libusb_cancel_transfer() on timeouts from its event thread while holding its
+ * own transfer lock, so on_cancel() must not take lock or call into libusb:
+ * another thread may hold lock while waiting for that libusb lock in
+ * libusb_submit_transfer(). The restore is done later by cancel_restore_thread().
+ */
+static unsigned long scan_gen;            /* bumped on every 40 3f (scan start) and close */
+static unsigned long cancel_gen;          /* scan_gen at the latest cancel */
+static int cancel_restore_queued;
+
+/*
  * Set while the shim itself sends a command. libusb's own sync transfers call
  * libusb_submit_transfer(), which resolves to our wrapper; without this guard
  * that re-enters on_command() while lock is held and deadlocks.
@@ -243,6 +254,7 @@ static void on_command(libusb_device_handle *h, const unsigned char *b, int len,
     pthread_mutex_lock(&lock);
     elan_handle = h;
     if (before && is_cmd(b, len, 0x40, 0x3f)) {
+        __atomic_add_fetch(&scan_gen, 1, __ATOMIC_SEQ_CST);
         if (fail_pending) {
             decision("re-arm white");
             fail_pending = 0;
@@ -270,6 +282,7 @@ static void on_handle_gone(libusb_device_handle *h, const char *what)
 
     decision(what);
     pthread_mutex_lock(&lock);
+    __atomic_add_fetch(&scan_gen, 1, __ATOMIC_SEQ_CST);
     pending = fail_pending && led_is_green;
     fail_pending = 0;
     timer_gen++;
@@ -292,19 +305,45 @@ static void on_handle_gone(libusb_device_handle *h, const char *what)
  * The driver cancels its pending transfer when the client stops the scan
  * without a result (VerifyStop, e.g. the lock screen unlocked by password).
  * No 00 0b follows, and fprintd may keep the device open, so restore here.
+ *
+ * Runs on its own thread: see scan_gen for why on_cancel() cannot do it.
+ * Skipped if a new scan started since the cancel (it already set the LED)
+ * or the device was closed (close restores it).
  */
-static void on_cancel(struct libusb_transfer *t)
+static void *cancel_restore_thread(void *arg)
 {
-    if (mode == MODE_LOG)
-        fprintf(stderr, "elan-led-shim: cancel ep%02x\n", t->endpoint);
+    unsigned long gen;
+
+    (void)arg;
     pthread_mutex_lock(&lock);
-    if (led_is_green) {
+    __atomic_store_n(&cancel_restore_queued, 0, __ATOMIC_SEQ_CST);
+    gen = __atomic_load_n(&cancel_gen, __ATOMIC_SEQ_CST);
+    if (elan_handle && led_is_green && __atomic_load_n(&scan_gen, __ATOMIC_SEQ_CST) == gen) {
         decision("restore on cancel");
         fail_pending = 0;
         timer_gen++;
-        set_led_locked(t->dev_handle, 0, 1);
+        set_led_locked(elan_handle, 0, 1);
     }
     pthread_mutex_unlock(&lock);
+    return NULL;
+}
+
+/* No lock and no libusb calls here, see scan_gen. */
+static void on_cancel(struct libusb_transfer *t)
+{
+    pthread_t thread;
+    pthread_attr_t attr;
+
+    if (mode == MODE_LOG)
+        fprintf(stderr, "elan-led-shim: cancel ep%02x\n", t->endpoint);
+    __atomic_store_n(&cancel_gen, __atomic_load_n(&scan_gen, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST);
+    if (__atomic_exchange_n(&cancel_restore_queued, 1, __ATOMIC_SEQ_CST))
+        return;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&thread, &attr, cancel_restore_thread, NULL) != 0)
+        __atomic_store_n(&cancel_restore_queued, 0, __ATOMIC_SEQ_CST);
+    pthread_attr_destroy(&attr);
 }
 
 static void on_match_result(int matched)
